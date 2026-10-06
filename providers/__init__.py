@@ -676,9 +676,20 @@ def _run_discovery_steps() -> None:
     _discover_entry_point_providers()
 
     # 1. Bundled plugins — shipped with hermes-agent.
+    # ``plugins.disabled`` wins over bundled auto-load too: a bundled provider
+    # plugin the user denied (e.g. a pre-release one that cannot import in this
+    # env) must not be imported on every startup pass.
+    try:
+        from hermes_cli.plugins import _get_disabled_plugins
+        _bundled_disabled = _get_disabled_plugins()
+    except Exception:
+        _bundled_disabled = set()
     if _BUNDLED_PLUGINS_DIR.is_dir():
         for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            if child.name in _bundled_disabled or child.name.replace("-", "_") in _bundled_disabled:
+                logger.debug("bundled provider plugin %s skipped (plugins.disabled)", child.name)
                 continue
             _import_plugin_dir(child, "bundled")
 
