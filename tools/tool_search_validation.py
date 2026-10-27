@@ -13,6 +13,34 @@ from tools.tool_search_catalog import BRIDGE_TOOL_NAMES, _registry_entry
 
 logger = logging.getLogger("tools.tool_search")
 
+# Forensic logger for dropped/absent tool_call arguments (#3 US3): one structured
+# line per dropped call so production logs can distinguish bridge-loss from bad calls.
+forensics_logger = logging.getLogger("hermes.tools.args_forensics")
+
+_FORENSICS_REPR_MAX_CHARS = 500
+
+
+def _forensics_dropped_args(name: str, raw_args: Any, outcome: str) -> None:
+    """Emit a single-line forensic warning when a tool that declares required
+    parameters receives absent/unparseable arguments. No stack traces, warning
+    level (safe under production log levels)."""
+    try:
+        from tools.registry import registry as _registry
+        schema = _registry.get_schema(name)
+        fn = schema.get("function") if isinstance(schema, dict) and schema.get("type") == "function" else schema
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        required = params.get("required") if isinstance(params, dict) else None
+        if not (isinstance(required, list) and required):
+            return  # tool takes no required params: nothing was dropped
+    except Exception:  # pragma: no cover — forensics must never affect dispatch
+        return
+    raw_repr = repr(raw_args)
+    if len(raw_repr) > _FORENSICS_REPR_MAX_CHARS:
+        raw_repr = raw_repr[:_FORENSICS_REPR_MAX_CHARS - 3] + "..."
+    forensics_logger.warning(
+        "tool_call args dropped for '%s': outcome=%s received_required=%s raw_args=%s",
+        name, outcome, required, raw_repr)
+
 _SCHEMA_LITERAL_KEYS = frozenset({"const", "default", "enum", "example", "examples"})
 
 
@@ -95,9 +123,12 @@ def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str
         missing = ([r for r in required if isinstance(r, str) and r not in args]
                    if isinstance(required, list) else [])
         if missing:
+            received = ", ".join(sorted(str(k) for k in args)) if args else ""
+            received_note = (f" received argument keys: [{received}]." if received
+                             else " received argument keys: [].")
             return _validation_error(
                 f"tool_call to '{name}' is missing required argument(s): "
-                f"{', '.join(missing)}. The tool was NOT invoked.",
+                f"{', '.join(missing)}. The tool was NOT invoked.{received_note}",
                 path="arguments", constraint="required", parameters=params)
         validation_schema = _schema_for_local_validation(params)
         if _schema_has_external_ref(validation_schema):
@@ -178,11 +209,13 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
             # parameterless tool (#83937); the loop already treats an empty outer arguments string
             # as {} (turn_tool_validation), and a missing required param still surfaces below via
             # validate_deferred_call_args instead of an opaque JSON parse error.
+            _forensics_dropped_args(name, raw_args, outcome="absent")
             raw_args = {}
         if isinstance(raw_args, str):
             try:
                 raw_args = json.loads(raw_args)
             except json.JSONDecodeError as e:
+                _forensics_dropped_args(name, raw_args, outcome="unparseable")
                 return [], f"tool_call calls[{position}].arguments is not valid JSON: {e}"
         if not isinstance(raw_args, dict):
             return [], f"tool_call calls[{position}].arguments must be an object"
